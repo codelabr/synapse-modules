@@ -1,0 +1,47 @@
+services:
+  synapse:
+    image: matrixdotorg/synapse:v1.129.0
+    container_name: synapse
+    volumes:
+      - /home/bes01/matrix_e2ee_filter/matrix_e2ee_filter.py:/usr/local/lib/python3.12/site-packages/matrix_e2ee_filter.py
+      - /home/bes01/custom-sso-templates/_base.html:/usr/local/lib/python3.12/site-packages/synapse/res/templates/_base.html
+      - /home/bes01/custom-sso-templates/sso_partial_profile.html:/usr/local/lib/python3.12/site-packages/synapse/res/templates/sso_partial_profile.html
+      - /home/bes01/custom-sso-templates/sso_redirect_confirm.html:/usr/local/lib/python3.12/site-packages/synapse/res/templates/sso_redirect_confirm.html
+      - /home/bes01/synapse:/data
+    environment:
+      - SSL_CERT_FILE=/data/lagroup_vn_full.pem
+    ports:
+      - "8008:8008"
+    networks:
+      - synapse-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16.9-alpine
+    container_name: postgres
+    environment:
+      - POSTGRES_USER=synapse_user
+      - POSTGRES_PASSWORD=Globits!321
+      - POSTGRES_DB=synapse
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "synapse_user", "-d", "synapse"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - synapse-network
+
+networks:
+  synapse-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+volumes:
+  postgres-data:
