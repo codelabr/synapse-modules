@@ -54,6 +54,13 @@ password_config:
    enabled: false
    localdb_enabled: false
 
+# Auto accept invites
+auto_accept_invites:
+    enabled: true
+    only_for_direct_messages: false
+    only_from_local_users: true
+    worker_to_run_on: null
+
 # Disable end to end encryption
 encryption_enabled_by_default_for_room_type: off
 modules:
