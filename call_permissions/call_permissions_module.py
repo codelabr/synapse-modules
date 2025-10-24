@@ -1,304 +1,369 @@
 """
 Synapse Module: Auto Call Permissions
-Tự động thiết lập quyền gọi thoại/video cho tất cả thành viên trong rooms mới
+Tự động thiết lập quyền gọi thoại/video cho tất cả thành viên trong rooms
 
 Cài đặt:
 1. Đặt file này vào thư mục modules của Synapse
-2. Cấu hình trong homeserver.yaml
+2. Cấu hình trong homeserver.yaml:
+   
+   modules:
+     - module: call_permissions_module.CallPermissionsModule
+       config:
+         enable_auto_call_permissions: true
+         call_permission_level: 0
+         also_set_events_default: true
+
 3. Restart Synapse
 """
 
 import logging
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple
+from twisted.internet import defer, reactor
 from synapse.module_api import ModuleApi
-from synapse.types import Requester, StateMap
 from synapse.events import EventBase
 from synapse.api.constants import EventTypes, Membership
+from synapse.types import UserID, create_requester
 
 logger = logging.getLogger(__name__)
 
 
 class CallPermissionsModule:
     """
-    Module tự động cấu hình quyền gọi cho rooms mới
+    Module tự động cấu hình quyền gọi cho rooms
     """
     
     def __init__(self, config: Dict[str, Any], api: ModuleApi):
         """
         Khởi tạo module
-        
-        Args:
-            config: Cấu hình từ homeserver.yaml
-            api: Module API của Synapse
         """
         self._api = api
         self._config = config
+        self._reactor = reactor
         
-        # Cấu hình mặc định
+        # Cấu hình
         self._enable_auto_call_permissions = config.get("enable_auto_call_permissions", True)
-        self._call_permission_level = config.get("call_permission_level", 0)  # 0 = tất cả users
-        self._excluded_room_types = config.get("excluded_room_types", [])
-        self._excluded_room_prefixes = config.get("excluded_room_prefixes", ["#admin:", "#system:"])
+        self._call_permission_level = config.get("call_permission_level", 0)
+        self._also_set_events_default = config.get("also_set_events_default", True)
+        self._excluded_room_types = config.get("excluded_room_types", ["m.space"])
         
-        # Log cấu hình
-        logger.info(f"CallPermissionsModule loaded with config: {config}")
+        logger.info("="*80)
+        logger.info(f"🚀 CallPermissionsModule STARTED")
+        logger.info(f"   Permission level: {self._call_permission_level}")
+        logger.info(f"   Set events_default: {self._also_set_events_default}")
+        logger.info("="*80)
         
         # Đăng ký callbacks
         self._api.register_third_party_rules_callbacks(
-            on_new_event=self._on_new_event,
+            check_event_allowed=self._check_event_allowed,
         )
-        
-        # Đăng ký callback cho room creation (nếu có)
-        try:
-            self._api.register_spam_checker_callbacks(
-                check_event_for_spam=self._check_event_for_spam,
-            )
-        except AttributeError:
-            # Fallback cho versions cũ hơn
-            pass
     
-    async def _on_new_event(
+    async def _check_event_allowed(
         self,
         event: EventBase,
-        state_events: StateMap[EventBase],
+        state_events: Dict[Any, Any],
+    ) -> Tuple[bool, Optional[dict]]:
+        """
+        Callback kiểm tra event - trigger khi có room mới
+        """
+        logger.info(f"🔍 Processing event {event.type} for room {event.room_id}, is_direct: {event.content.get('is_direct', False)}")
+        try:
+            # Xử lý m.room.create events (room mới)
+            if event.type == EventTypes.Create:
+                if self._enable_auto_call_permissions:
+                    room_id = event.room_id
+                    
+                    if not await self._should_exclude_room(event):
+                        logger.info(f"🆕 NEW ROOM: {room_id} by {event.sender}")
+                        
+                        # Schedule với reactor.callLater
+                        self._reactor.callLater(
+                            3.0,  # delay 3 giây
+                            lambda: defer.ensureDeferred(
+                                self._setup_call_permissions_with_retry(room_id, event.sender, 0)
+                            )
+                        )
+            
+            return (True, None)
+            
+        except Exception as e:
+            logger.error(f"❌ Error in check_event_allowed: {e}", exc_info=True)
+            return (True, None)
+    
+    async def _setup_call_permissions_with_retry(
+        self, 
+        room_id: str, 
+        creator: str,
+        attempt: int
     ) -> None:
         """
-        Callback khi có event mới
-        Kiểm tra nếu là room creation event thì thiết lập quyền gọi
+        Setup permissions với retry logic - không dùng asyncio.sleep
         """
-        try:
-            # Chỉ xử lý m.room.create events
-            if event.type != EventTypes.Create:
-                return
-                
-            # Bỏ qua nếu tính năng bị tắt
-            if not self._enable_auto_call_permissions:
-                return
-                
-            room_id = event.room_id
-            
-            # Kiểm tra loại room có bị loại trừ không
-            if await self._should_exclude_room(room_id, event):
-                logger.info(f"Skipping room {room_id} - excluded by configuration")
-                return
-            
-            logger.info(f"Setting up call permissions for new room: {room_id}")
-            
-            # Đợi một chút để room được tạo hoàn toàn
-            await self._setup_call_permissions(room_id)
-            
-        except Exception as e:
-            logger.error(f"Error in _on_new_event: {e}", exc_info=True)
-    
-    async def _check_event_for_spam(
-        self,
-        event: EventBase,
-    ) -> Union[bool, str]:
-        """
-        Spam checker callback - sử dụng để detect room creation
-        """
-        try:
-            if event.type == EventTypes.Create:
-                # Không phải spam, nhưng trigger setup permissions
-                room_id = event.room_id
-                if not await self._should_exclude_room(room_id, event):
-                    # Schedule permission setup
-                    self._api.run_in_background(self._setup_call_permissions, room_id)
-        except Exception as e:
-            logger.error(f"Error in spam checker: {e}", exc_info=True)
+        max_attempts = 6
         
-        # Không block event
-        return False
+        try:
+            logger.info(f"⏳ Attempt {attempt + 1}/{max_attempts} for room {room_id}")
+            
+            # Kiểm tra xem room đã sẵn sàng chưa
+            state = await self._api.get_room_state(room_id)
+            if state and (EventTypes.PowerLevels, "") in state:
+                logger.info(f"✅ Room {room_id} is ready")
+                await self._setup_call_permissions(room_id, creator)
+                return
+            
+            # Chưa sẵn sàng, retry
+            if attempt < max_attempts - 1:
+                wait_time = 2 ** attempt  # exponential backoff
+                logger.debug(f"Room not ready, retrying in {wait_time}s...")
+                
+                # Schedule retry với reactor.callLater
+                self._reactor.callLater(
+                    wait_time,
+                    lambda: defer.ensureDeferred(
+                        self._setup_call_permissions_with_retry(room_id, creator, attempt + 1)
+                    )
+                )
+            else:
+                logger.error(f"❌ Room {room_id} never became ready after {max_attempts} attempts")
+            
+        except Exception as e:
+            logger.error(f"❌ Error in retry setup for {room_id}: {e}", exc_info=True)
     
-    async def _should_exclude_room(self, room_id: str, create_event: EventBase) -> bool:
+    async def _should_exclude_room(self, create_event: EventBase) -> bool:
         """
         Kiểm tra room có nên bị loại trừ không
         """
-        try:
-            # Kiểm tra theo room type
-            room_type = create_event.content.get("type")
-            if room_type in self._excluded_room_types:
-                return True
-            
-            # Kiểm tra theo prefix của room alias
-            try:
-                aliases = await self._api.get_room_aliases(room_id)
-                for alias in aliases:
-                    for prefix in self._excluded_room_prefixes:
-                        if alias.startswith(prefix):
-                            return True
-            except:
-                pass  # Không có aliases hoặc lỗi
-            
-            # Kiểm tra room name
-            try:
-                room_name = create_event.content.get("name", "")
-                for prefix in ["Admin", "System", "Bot"]:
-                    if room_name.startswith(prefix):
-                        return True
-            except:
-                pass
-                
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error checking room exclusion: {e}")
-            return False
+        room_type = create_event.content.get("type")
+        if room_type in self._excluded_room_types:
+            logger.info(f"⏭️  Excluding room type: {room_type}")
+            return True
+        # Kiểm tra nếu là DM
+        is_direct = create_event.content.get("is_direct", False)
+        if is_direct:
+            logger.info(f"🎯 Processing DM room")
+            return False            
+        return False
     
-    async def _setup_call_permissions(self, room_id: str) -> None:
+    async def _setup_call_permissions(self, room_id: str, sender: str) -> None:
         """
         Thiết lập quyền gọi cho room
         """
         try:
-            # Đợi room được tạo hoàn toàn
-            await self._api.sleep(2)
+            logger.info(f"🔧 Setting up call permissions for room {room_id}")
             
             # Lấy power levels hiện tại
-            current_power_levels = await self._get_room_power_levels(room_id)
-            if not current_power_levels:
-                logger.warning(f"Could not get power levels for room {room_id}")
-                return
-            
-            # Thiết lập quyền gọi
-            events = current_power_levels.setdefault("events", {})
-            
-            # Các events liên quan đến calls
-            call_events = [
-                "m.call.invite",
-                "m.call.answer", 
-                "m.call.hangup",
-                "m.call.select_answer",
-                "org.matrix.msc3401.call.member",  # Group calls
-                "org.matrix.msc3401.call",
-            ]
-            
-            # Kiểm tra xem có cần cập nhật không
-            needs_update = False
-            for event_type in call_events:
-                if events.get(event_type, 50) != self._call_permission_level:
-                    events[event_type] = self._call_permission_level
-                    needs_update = True
-            
-            if not needs_update:
-                logger.info(f"Room {room_id} already has correct call permissions")
-                return
-            
-            # Cập nhật power levels
-            success = await self._update_room_power_levels(room_id, current_power_levels)
-            
-            if success:
-                logger.info(f"✅ Successfully set call permissions for room {room_id}")
-            else:
-                logger.error(f"❌ Failed to set call permissions for room {room_id}")
-                
-        except Exception as e:
-            logger.error(f"Error setting up call permissions for {room_id}: {e}", exc_info=True)
-    
-    async def _get_room_power_levels(self, room_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Lấy power levels hiện tại của room
-        """
-        try:
             state = await self._api.get_room_state(room_id)
             power_levels_event = state.get((EventTypes.PowerLevels, ""))
             
-            if power_levels_event:
-                return dict(power_levels_event.content)
-            else:
-                # Tạo power levels mặc định
-                return {
-                    "users": {},
-                    "users_default": 0,
-                    "events": {},
-                    "events_default": 0,
-                    "state_default": 50,
-                    "ban": 50,
-                    "kick": 50,
-                    "redact": 50,
-                    "invite": 0,
-                }
-        except Exception as e:
-            logger.error(f"Error getting power levels for {room_id}: {e}")
-            return None
-    
-    async def _update_room_power_levels(self, room_id: str, power_levels: Dict[str, Any]) -> bool:
-        """
-        Cập nhật power levels cho room
-        """
-        try:
-            # Tìm một admin user để thực hiện cập nhật
-            admin_user = await self._find_admin_user(room_id)
-            if not admin_user:
-                logger.error(f"No admin user found for room {room_id}")
-                return False
+            if not power_levels_event:
+                logger.error(f"❌ No power levels found for {room_id}")
+                return
             
-            # Tạo requester
-            requester = Requester.test()  # Hoặc tạo requester từ admin user
+            # Clone content - DEEP COPY để tránh immutabledict
+            import copy
+            new_power_levels = copy.deepcopy(dict(power_levels_event.content))
+            
+            # Đảm bảo events là dict thông thường
+            if "events" not in new_power_levels:
+                new_power_levels["events"] = {}
+            else:
+                # Convert immutabledict thành dict thông thường
+                new_power_levels["events"] = dict(new_power_levels["events"])
+            
+            events = new_power_levels["events"]
+            
+            logger.info(f"📊 Current events_default: {new_power_levels.get('events_default', 0)}")
+            
+            # Danh sách FULL các call events
+            call_events = [
+                # 1:1 calls
+                "m.call.invite",
+                "m.call.answer",
+                "m.call.hangup",
+                "m.call.candidates",
+                "m.call.select_answer",
+                "m.call.reject",
+                "m.call.negotiate",
+                # Group calls
+                "org.matrix.msc3401.call",
+                "org.matrix.msc3401.call.member",
+                "m.call.member",
+                # Widgets
+                "im.vector.modular.widgets",
+            ]
+            
+            # Update events - Tạo dict mới thay vì modify
+            changes = []
+            updated_events = {}
+            
+            # Copy tất cả events hiện có
+            for k, v in events.items():
+                updated_events[k] = v
+            
+            # Update call events
+            for event_type in call_events:
+                old_level = updated_events.get(event_type, "not set")
+                updated_events[event_type] = self._call_permission_level
+                if old_level != self._call_permission_level:
+                    changes.append(f"{event_type}: {old_level} → {self._call_permission_level}")
+            
+            # Gán lại events dict mới
+            new_power_levels["events"] = updated_events
+            
+            # CRITICAL: Set events_default
+            if self._also_set_events_default:
+                old_default = new_power_levels.get("events_default", 0)
+                if old_default > self._call_permission_level:
+                    new_power_levels["events_default"] = self._call_permission_level
+                    changes.append(f"events_default: {old_default} → {self._call_permission_level}")
+            
+            if not changes:
+                logger.info(f"✅ Room {room_id} already correct")
+                return
+            
+            logger.info(f"🔄 Applying {len(changes)} changes")
+            for change in changes[:5]:  # Log first 5
+                logger.info(f"   • {change}")
+            
+            # Tìm admin để send event
+            admin_user = await self._find_admin_user(new_power_levels)
+            if not admin_user:
+                admin_user = sender
+            
+            logger.info(f"👤 Using user: {admin_user}")
             
             # Send state event
-            await self._api.create_and_send_event_into_room(
-                {
-                    "type": EventTypes.PowerLevels,
-                    "room_id": room_id,
-                    "sender": admin_user,
-                    "content": power_levels,
-                    "state_key": "",
-                }
+            success = await self._send_state_event(
+                room_id=room_id,
+                event_type=EventTypes.PowerLevels,
+                content=new_power_levels,
+                state_key="",
+                user_id=admin_user
             )
             
+            if success:
+                logger.info(f"✅ SUCCESS for room {room_id}")
+                # Schedule verification sau 1 giây
+                self._reactor.callLater(
+                    1.0,
+                    lambda: defer.ensureDeferred(self._verify_permissions(room_id))
+                )
+            else:
+                logger.error(f"❌ FAILED for room {room_id}")
+                
+        except Exception as e:
+            logger.error(f"❌ Error setting up {room_id}: {e}", exc_info=True)
+    
+    async def _send_state_event(
+        self,
+        room_id: str,
+        event_type: str,
+        content: Dict[str, Any],
+        state_key: str,
+        user_id: str
+    ) -> bool:
+        """
+        Gửi state event
+        """
+        try:
+            # Tạo requester
+            requester = create_requester(
+                user_id=user_id,
+                authenticated_entity=user_id,
+            )
+            
+            # Lấy event creation handler
+            event_creation_handler = self._api._hs.get_event_creation_handler()
+            
+            # Tạo và gửi event
+            event, _ = await event_creation_handler.create_and_send_nonmember_event(
+                requester=requester,
+                event_dict={
+                    "type": event_type,
+                    "room_id": room_id,
+                    "sender": user_id,
+                    "state_key": state_key,
+                    "content": content,
+                },
+                ratelimit=False,
+            )
+            
+            logger.info(f"✅ Event sent: {event.event_id}")
             return True
             
         except Exception as e:
-            logger.error(f"Error updating power levels for {room_id}: {e}")
-            return False
+            logger.error(f"❌ Error sending state event: {e}", exc_info=True)
+            
+            # Fallback
+            try:
+                logger.info("🔄 Trying fallback method...")
+                event_dict = {
+                    "type": event_type,
+                    "room_id": room_id,
+                    "sender": user_id,
+                    "state_key": state_key,
+                    "content": content,
+                }
+                event, _ = await self._api.create_and_send_event_into_room(event_dict)
+                logger.info(f"✅ Fallback success: {event.event_id}")
+                return True
+            except Exception as e2:
+                logger.error(f"❌ Fallback failed: {e2}")
+                return False
     
-    async def _find_admin_user(self, room_id: str) -> Optional[str]:
+    async def _verify_permissions(self, room_id: str) -> None:
         """
-        Tìm một admin user trong room
+        Verify permissions sau khi update
         """
         try:
-            # Lấy danh sách members
-            members = await self._api.get_room_members(room_id)
+            state = await self._api.get_room_state(room_id)
+            pl_event = state.get((EventTypes.PowerLevels, ""))
             
-            # Lấy power levels
-            power_levels = await self._get_room_power_levels(room_id)
-            if not power_levels:
-                return None
+            if not pl_event:
+                return
             
-            users = power_levels.get("users", {})
+            events = pl_event.content.get("events", {})
+            events_default = pl_event.content.get("events_default", 0)
             
-            # Tìm user có power level cao nhất
-            max_power = 0
-            admin_user = None
+            logger.info(f"🔍 Verification for {room_id}:")
+            logger.info(f"   events_default: {events_default}")
             
-            for user_id in members:
-                user_power = users.get(user_id, power_levels.get("users_default", 0))
-                if user_power >= max_power and user_power >= 50:  # Admin level
-                    max_power = user_power
-                    admin_user = user_id
-            
-            return admin_user
-            
+            checks = ["m.call.invite", "m.call.member", "org.matrix.msc3401.call.member"]
+            for evt in checks:
+                level = events.get(evt, events_default)
+                status = "✅" if level == self._call_permission_level else "❌"
+                logger.info(f"   {status} {evt}: {level}")
+                
         except Exception as e:
-            logger.error(f"Error finding admin user for {room_id}: {e}")
-            return None
+            logger.error(f"Error verifying: {e}")
+    
+    async def _find_admin_user(self, power_levels: Dict[str, Any]) -> Optional[str]:
+        """
+        Tìm admin user
+        """
+        users = power_levels.get("users", {})
+        
+        for user_id, power in users.items():
+            if power >= 50:
+                return user_id
+        
+        return None
     
     @staticmethod
     def parse_config(config: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Parse và validate config
+        Parse config
         """
         return {
             "enable_auto_call_permissions": config.get("enable_auto_call_permissions", True),
             "call_permission_level": config.get("call_permission_level", 0),
-            "excluded_room_types": config.get("excluded_room_types", []),
-            "excluded_room_prefixes": config.get("excluded_room_prefixes", ["#admin:", "#system:"]),
+            "also_set_events_default": config.get("also_set_events_default", True),
+            "excluded_room_types": config.get("excluded_room_types", ["m.space"]),
         }
 
 
-# Entry point cho Synapse
 def create_module(config: Dict[str, Any], api: ModuleApi) -> CallPermissionsModule:
     """
-    Factory function để tạo module instance
+    Factory function
     """
-    return CallPermissionsModule(config, api)
+    parsed_config = CallPermissionsModule.parse_config(config)
+    return CallPermissionsModule(parsed_config, api)
